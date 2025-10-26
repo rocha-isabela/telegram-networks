@@ -1,0 +1,551 @@
+# =========== CELL 1 ===========
+  
+# @title **0. [REQUIRED] Install libraries and ready the code** { display-mode: "form" }
+# @markdown ✅ **This cell installs the libraries necessary to run the code.** Always run whenever starting a new session.
+
+!pip install pandas pyarrow fastparquet numpy
+!pip install -q pandas pyarrow fastparquet numpy simhash tqdm openpyxl
+
+import re
+import hashlib
+import pandas as pd
+import numpy as np
+from collections import defaultdict
+from typing import Iterable, List, Tuple, Dict, Optional
+import os
+from simhash import Simhash
+from tqdm.auto import tqdm
+import glob
+import matplotlib.pyplot as plt
+from textwrap import shorten
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+from google.colab import files
+import os, glob, re, warnings
+import IPython.display as display
+import networkx as nx
+
+# =========== CELL 2 ===========
+
+# @title **1. [REQUIRED] Set inputs and identify shared messages** { display-mode: "form" }
+# @markdown ✅ **This cell prepares the dataset for network construction by identifying shared or near-shared messages.** Since Telegram does not directly indicate when the same content circulates across groups, **SimHash** is used to detect equality (or near equality) between messages. Each message is normalized, hashed, and assigned a **SimhashID**: messages with the same ID are treated as duplicates or near-duplicates. This provides the essential foundation for building networks of shared content.
+
+# @markdown **Step by step, the script does the following:**
+# @markdown - Reads the selected Parquet file (efficient storage and processing format).
+# @markdown - Normalizes each message by lowercasing and stripping whitespace.
+# @markdown - Computes a numeric SimHash for every message (`simhash` column).
+# @markdown - Groups identical or near-identical messages under a compact `SimhashID` (new column).
+# @markdown - Saves the processed data back into Parquet (and optionally splits to Excel for large files).
+
+# ==== Inputs (edit as needed) ====
+
+# @markdown ✅ **Inputs you configure:**  Configure the parameters below to prepare your dataset for SimHash processing.
+# @markdown - `input_filename` → the name of the Parquet file containing your Telegram data.
+# @markdown - `content_col` → which column contains the message text (e.g., "Content" or "message" depending on your dataset).
+# @markdown - `min_chars` → minimum message length to include; shorter texts are skipped (to avoid noise from “ok”, “yes”, emojis, etc.).
+# @markdown - `max_rows_per_file` → if exporting to Excel, large datasets are split into chunks of this size.
+# @markdown - `output_filename` → base name for the output files (the processed Parquet and optional Excel).
+# @markdown - `save_excel` → whether to also export results into Excel format (`True` or `False`).
+
+input_filename = "unified_data_telegram.parquet"  # @param {type:"string"}
+content_col = "message"                          # @param {type:"string"}
+min_chars = 30                                   # @param {type:"integer"}
+max_rows_per_file = 1_000_000                    # @param {type:"integer"}
+output_filename = "processed_output"             # @param {type:"string"}
+save_excel = False                               # @param {type:"boolean"}
+
+def normalize_text(text: str) -> str:
+    """Lowercase + strip; keep your normalization minimal, as requested."""
+    return str(text).lower().strip()
+
+def generate_simhash_id(text: str) -> int:
+    """Compute the SimHash value (integer) for a given text."""
+    return Simhash(normalize_text(text)).value
+
+def process_file(input_filename: str,
+                 content_col: str,
+                 min_chars: int,
+                 max_rows_per_file: int,
+                 output_filename: str,
+                 save_excel: bool = False) -> None:
+    try:
+        # Read the Parquet directly from Colab path
+        df = pd.read_parquet(input_filename)
+
+        # --- NEW: resolve the content column automatically ---
+        candidates = [content_col, "Content", "content", "message", "Message", "text", "Text", "Body"]
+        resolved = next((c for c in candidates if c in df.columns), None)
+        if resolved is None:
+            raise ValueError(f"Could not find a text column. Available columns: {list(df.columns)}")
+        if resolved != content_col:
+            print(f"Using text column: '{resolved}' (input requested: '{content_col}')")
+        content_col = resolved
+        # -----------------------------------------------------
+
+        # Filter by min_chars
+        df[content_col] = df[content_col].astype(str)
+        df = df[df[content_col].str.len() >= int(min_chars)].copy()
+        total_rows = len(df)
+
+        if total_rows == 0:
+            print("No rows met the minimum length requirement. Nothing to process.")
+            return
+
+        # Compute SimHash in batches
+        batch_size = 100_000
+        simhash_values = []
+        print(f"Hashing {total_rows:,} rows (batch size: {batch_size:,})...")
+        for start in tqdm(range(0, total_rows, batch_size), desc="Computing SimHash", unit="batch"):
+            end = min(start + batch_size, total_rows)
+            chunk = df.iloc[start:end]
+            simvals = chunk[content_col].apply(generate_simhash_id)
+            simhash_values.append(simvals)
+
+        # Add simhash + compact SimhashID columns
+        df["simhash"] = pd.concat(simhash_values).astype("uint64").values
+        df["SimhashID"] = pd.factorize(df["simhash"], sort=False)[0].astype("int64")
+
+        print(f"Number of rows in the processed dataframe: {len(df):,}")
+
+        # Save Parquet
+        parquet_output_path = f"{output_filename}_filtered.parquet"
+        df.to_parquet(parquet_output_path, index=False)
+        print(f"Filtered Parquet file saved at: {parquet_output_path}")
+
+        # Optionally split and save Excel
+        if save_excel:
+            num_files = (len(df) // max_rows_per_file) + int(len(df) % max_rows_per_file > 0)
+            print(f"Saving {num_files} Excel file(s) with up to {max_rows_per_file:,} rows each...")
+            for i in tqdm(range(num_files), desc="Saving Excel files"):
+                start_row = i * max_rows_per_file
+                end_row = min((i + 1) * max_rows_per_file, len(df))
+                output_df = df.iloc[start_row:end_row]
+                part_suffix = "unique" if num_files == 1 else f"part_{i + 1}"
+                excel_output_path = f"{output_filename}_{part_suffix}.xlsx"
+                output_df.to_excel(excel_output_path, index=False, engine="openpyxl")
+                print(f"Excel file saved at: {excel_output_path}")
+
+        print("Processing completed.")
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+# === Run ===
+process_file(
+    input_filename=input_filename,
+    content_col=content_col,
+    min_chars=min_chars,
+    max_rows_per_file=max_rows_per_file,
+    output_filename=output_filename,
+    save_excel=save_excel
+)
+
+# =========== CELL 3 ===========
+
+# @title **2. [QUANTITATIVE DATA] Assess the most shared messages** { display-mode: "form" }
+# @markdown ✅ **This cell helps you explore the most frequently shared messages detected by SimHash.**
+# @markdown By aggregating identical or near-identical messages under the same **SimhashID**, we can count how often each message appears across the dataset. This makes it easy to see which pieces of content were most widely circulated.
+#
+# @markdown **Step by step, the script does the following:**
+# @markdown - Loads the processed dataset (from memory or the saved Parquet file).
+# @markdown - Aggregates messages by `SimhashID` to count duplicates.
+# @markdown - Displays a chart of the most frequently shared messages.
+# @markdown - Optionally prepares CSV files with either the **Top N results** or **all results**.
+#
+# ==== Inputs (edit as needed) ====
+# @markdown ✅ **Inputs you configure:** Use the options below to control how many top shared messages to view and whether to download CSV outputs.
+# @markdown - `parquet_path` → optional: path to a specific processed Parquet file (leave blank to auto-detect).
+# @markdown - `Number_of_most_shared_messages` → how many top Simhash groups to display in the chart.
+# @markdown - `Download_the_csv_file_with_the_selected_number_of_messages` → export only the Top N results.
+# @markdown - `Download_the_csv_file_with_all_messages` → export all aggregated results.
+# @markdown - `Characters_in_label` → maximum number of characters shown per label in the chart.
+
+parquet_path = ""                  # @param {type:"string"}
+Number_of_most_shared_messages = 10   # @param {type:"integer"}
+Download_the_csv_file_with_the_selected_number_of_messages = False  # @param {type:"boolean"}
+Download_the_csv_file_with_all_messages = False  # @param {type:"boolean"}
+Characters_in_label = 60           # @param {type:"integer"}
+
+# ==== Code ====
+
+# Suppress DejaVu Sans glyph warnings (emoji/symbols not in font)
+warnings.filterwarnings(
+    "ignore",
+    message=r"Glyph .* missing from font\(s\) DejaVu Sans\.",
+    category=UserWarning
+)
+
+# Optional: strip emojis/symbols from labels to keep plots tidy
+EMOJI_RE = re.compile(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF]")
+def strip_emoji(s): return EMOJI_RE.sub("", str(s))
+
+# Load DataFrame
+def _load_df():
+    try:
+        if 'df' in globals() and isinstance(df, pd.DataFrame):
+            return df
+    except:
+        pass
+    candidates = []
+    if 'output_filename' in globals():
+        candidates.append(f"{output_filename}_filtered.parquet")
+    if parquet_path:
+        candidates.insert(0, parquet_path)
+    candidates.extend(sorted(glob.glob("*_filtered.parquet"), reverse=True))
+    for path in candidates:
+        if os.path.exists(path):
+            return pd.read_parquet(path)
+    raise FileNotFoundError("Could not find an in-memory DataFrame `df` or a *_filtered.parquet file.")
+
+# Detect text column
+def _resolve_text_col(df):
+    for c in ["Content", "message", "Message", "text", "Text", "Body"]:
+        if c in df.columns:
+            return c
+    return None
+
+# === Run ===
+try:
+    _df = _load_df()
+    text_col = _resolve_text_col(_df)
+    if text_col is None:
+        raise ValueError(f"Could not find a text column. Available: {list(_df.columns)}")
+    if "SimhashID" not in _df.columns:
+        raise ValueError("Column 'SimhashID' not found. Please run the SimHash step first.")
+
+    # Aggregate by SimhashID
+    agg = (
+        _df.groupby("SimhashID", as_index=False)
+           .agg(count=("SimhashID", "size"), example_text=(text_col, "first"))
+           .sort_values("count", ascending=False)
+    )
+
+    # Top N for chart
+    top_n = agg.head(int(Number_of_most_shared_messages)).copy()
+    top_n["Message Content"] = top_n["example_text"].apply(lambda s: strip_emoji(str(s)))
+    top_n = top_n.reset_index(drop=True)
+    top_n["Rank"] = top_n.index + 1  # 1-based rank
+
+    # ===== Chart: serif font + counts at the end of bars =====
+    plt.rcParams["font.family"] = "serif"
+    fig, ax = plt.subplots(figsize=(10, max(4, 0.4 * len(top_n))))
+    bars = ax.barh(top_n["Rank"][::-1], top_n["count"][::-1], color="steelblue")
+
+    # Add counts at the end of each bar
+    for bar, count in zip(bars, top_n["count"][::-1]):
+        ax.text(
+            bar.get_width() + 3,
+            bar.get_y() + bar.get_height() / 2,
+            str(count),
+            va="center",
+            ha="left",
+            fontsize=10
+        )
+
+    ax.set_yticks(top_n["Rank"][::-1])
+    ax.set_yticklabels(top_n["Rank"][::-1], fontname="serif")
+    ax.set_xlabel("Frequency (number of times the message was shared)", fontname="serif")
+    ax.set_title(f"Top {len(top_n)} most shared messages", fontname="serif")
+    plt.tight_layout()
+    plt.show()
+
+    # ===== Table: hide DataFrame index; use serif styling =====
+    display.display(
+        top_n[["Rank", "SimhashID", "count", "Message Content"]]
+            .style.hide(axis="index")
+            )
+
+    # Downloads
+    if Download_the_csv_file_with_the_selected_number_of_messages:
+        csv_top_path = "simhash_topN_groups.csv"
+        top_n[["Rank", "SimhashID", "count", "example_text"]].to_csv(csv_top_path, index=False)
+        print(f"CSV saved: {csv_top_path}")
+        files.download(csv_top_path)
+
+    if Download_the_csv_file_with_all_messages:
+        csv_all_path = "simhash_all_groups.csv"
+        agg[["SimhashID", "count", "example_text"]].to_csv(csv_all_path, index=False)
+        print(f"CSV saved: {csv_all_path}")
+        files.download(csv_all_path)
+
+except Exception as e:
+    print(f"Error: {e}")
+
+# =========== CELL 4 ===========
+
+# @title **3. [BUILD NETWORK] Co-occurrence network by equal SimHash** { display-mode: "form" }
+# @markdown ✅ **This cell builds a co-occurrence network based on SimHash clusters.**
+# @markdown Since Telegram does not directly indicate when messages are re-shared across groups, **SimHash** allows us
+# @markdown to detect identical or near-identical messages. By linking nodes (e.g., Groups, Authors, or Message IDs)
+# @markdown that share the same SimhashID, we can reconstruct hidden connections of content circulation.
+#
+# @markdown **Step by step, the script does the following:**
+# @markdown - Loads the processed dataset (from memory or a Parquet file).
+# @markdown - Filters out SimHash clusters smaller than a chosen size.
+# @markdown - Builds edges between nodes that share the same SimhashID (strength depends on `weight_mode`).
+# @markdown - Creates a nodes table with degree and strength for each node.
+# @markdown - Optionally saves the results as CSV/GraphML and triggers downloads for Gephi.
+# @markdown - Generates a quick in-notebook visualization with community colors, thin edges, and optional labels.
+#
+# ==== Inputs (edit as needed) ====
+# @markdown ✅ **Inputs you configure:** Adjust these to control how the network is built and visualized.
+# @markdown - `parquet_path` → path to the processed Parquet file (leave blank to auto-detect).
+# @markdown - `node_variable` → which variable defines the nodes (e.g., Group, Message ID, Author).
+# @markdown - `min_cluster_size` → ignore SimHash clusters smaller than this (removes noise).
+# @markdown - `weight_mode` → `"presence"` = +1 per co-occurrence, `"pairs"` = multiplicity of messages.
+# @markdown - `top_nodes_to_plot` → **how many of the highest-degree nodes to include in the preview subgraph.**
+# @markdown - `top_nodes_to_label` → **how many of those top nodes to label** (keeps the plot readable).
+# @markdown - `label_option` → how nodes are labeled in the preview (none, node ID, Group, or SimhashID).
+# @markdown - `layout_kind` → choose the visualization layout (`spring` or `kamada_kawai`).
+# @markdown - `edge_alpha` → transparency of edges in the preview.
+# @markdown - `edge_min_w` / `edge_max_w` → minimum/maximum line thickness for edges.
+# @markdown - `save_edges_csv` / `save_nodes_csv` / `save_graphml` → whether to save and download outputs.
+# @markdown - `output_prefix` → prefix for all output files (CSV/GraphML).
+
+# ==== Inputs (edit as needed) ====
+parquet_path = ""                     # @param {type:"string"}  # leave blank to auto-detect *_filtered.parquet or in-memory df
+node_variable = "Message ID"          # @param ["Group","Message ID"]
+min_cluster_size = 3                  # @param {type:"integer"}  # ignore Simhash clusters smaller than this
+weight_mode = "presence"              # @param ["presence", "pairs"]
+top_nodes_to_plot = 100               # @param {type:"integer"}  # visualization subset (by degree)
+save_edges_csv = False                # @param {type:"boolean"}
+save_nodes_csv = False                # @param {type:"boolean"}
+save_graphml  = False                  # @param {type:"boolean"}
+output_prefix = "network_simhash"     # @param {type:"string"}
+
+# @markdown **Visualization controls**
+top_nodes_to_label = 10               # @param {type:"integer"}  # how many of the plotted nodes to label (by degree)
+label_option = "Group"                # @param ["none","node_id","Group","SimhashID"]
+layout_kind  = "spring"               # @param ["spring","kamada_kawai"]
+seed         = 42                     # @param {type:"integer"}
+edge_alpha   = 0.25                   # @param {type:"number"}   # opacity of preview edges
+edge_min_w   = 0.2                    # @param {type:"number"}   # thinnest preview line
+edge_max_w   = 1.0                    # @param {type:"number"}   # thickest preview line
+
+# ==== Code ====
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# ---------- Helpers ----------
+def _load_df_for_network(parquet_path: str):
+    # 1) in-memory df
+    try:
+        if 'df' in globals() and isinstance(df, pd.DataFrame):
+            return df
+    except:
+        pass
+    # 2) explicit path
+    if parquet_path and os.path.exists(parquet_path):
+        return pd.read_parquet(parquet_path)
+    # 3) try <output_filename>_filtered.parquet
+    if 'output_filename' in globals():
+        cand = f"{output_filename}_filtered.parquet"
+        if os.path.exists(cand):
+            return pd.read_parquet(cand)
+    # 4) fallback: latest *_filtered.parquet
+    for path in sorted(glob.glob("*_filtered.parquet"), reverse=True):
+        if os.path.exists(path):
+            return pd.read_parquet(path)
+    raise FileNotFoundError("No dataframe in memory and no *_filtered.parquet present.")
+
+def _resolve_column(df: pd.DataFrame, wanted: str, custom: str=""):
+    """
+    Map friendly names to actual columns present in TelegramScrap outputs.
+    """
+    if wanted == "Custom...":
+        if not custom:
+            raise ValueError("Provide `custom_column_name` when node_variable == 'Custom...'.")
+        if custom in df.columns:
+            return custom
+        else:
+            raise ValueError(f"Custom column '{custom}' not found. Available: {list(df.columns)}")
+
+    mapping = {
+        "Group":      ["Group","group","group_name","group_id","Channel","channel"],
+        "Message ID": ["Message ID","message_id","id"],
+        "Author ID":  ["Author ID","author_id","from_id","user_id"],
+        "Url":        ["Url","url","link","Link"],
+        "Content":    ["Content","message","text","Message","Text"]
+    }
+    candidates = mapping.get(wanted, []) + [wanted]
+    for c in candidates:
+        if c in df.columns:
+            return c
+    raise ValueError(f"Could not resolve column for '{wanted}'. Available: {list(df.columns)}")
+
+def _ensure_simhash(df: pd.DataFrame):
+    if "SimhashID" not in df.columns:
+        raise ValueError("Column 'SimhashID' not found. Run the SimHash step first.")
+    return df
+
+def _combinations_from_counts(idx_vals, counts, mode="presence"):
+    """
+    Given unique values (idx_vals) and their counts within ONE SimhashID cluster,
+    yield (u,v,w) for u<v with weight w.
+    - presence: each unordered pair contributes +1
+    - pairs: contributes counts[u] * counts[v]
+    """
+    n = len(idx_vals)
+    if n < 2:
+        return
+    if mode == "presence":
+        for i in range(n):
+            ui = idx_vals[i]
+            for j in range(i+1, n):
+                vj = idx_vals[j]
+                yield ui, vj, 1
+    else:  # pairs
+        for i in range(n):
+            ui = idx_vals[i]; ci = counts[i]
+            for j in range(i+1, n):
+                vj = idx_vals[j]; cj = counts[j]
+                yield ui, vj, int(ci) * int(cj)
+
+# ---------- Build edges ----------
+df_net = _ensure_simhash(_load_df_for_network(parquet_path)).copy()
+custom_column_name = globals().get("custom_column_name", "")
+node_col = _resolve_column(df_net, node_variable, custom=custom_column_name)
+
+# Filter clusters by size
+cluster_sizes = df_net.groupby("SimhashID")["SimhashID"].transform("size")
+df_net = df_net.loc[cluster_sizes >= int(min_cluster_size)].copy()
+
+# Compute edges by iterating through clusters
+edges = {}
+for sid, chunk in df_net.groupby("SimhashID", sort=False):
+    vc = chunk[node_col].astype(str).value_counts()
+    items = vc.index.to_numpy()
+    counts = vc.values
+    for u, v, w in _combinations_from_counts(items, counts, mode=weight_mode):
+        if v < u:  # enforce undirected ordering
+            u, v = v, u
+        edges[(u, v)] = edges.get((u, v), 0) + w
+
+# Convert to DataFrame
+edge_list = (pd.DataFrame([(u, v, w) for (u, v), w in edges.items()],
+                          columns=["source","target","weight"])
+             if edges else pd.DataFrame(columns=["source","target","weight"]))
+
+# ---------- Nodes table ----------
+if not edge_list.empty:
+    deg = pd.concat([edge_list["source"], edge_list["target"]]).value_counts()
+    strength = pd.concat([
+        edge_list[["source","weight"]].rename(columns={"source":"node"}),
+        edge_list[["target","weight"]].rename(columns={"target":"node"})
+    ]).groupby("node")["weight"].sum()
+    nodes = pd.DataFrame({
+        "id": deg.index,
+        "degree": deg.values,
+        "strength": strength.reindex(deg.index).fillna(0).astype(int).values,
+    })
+else:
+    nodes = pd.DataFrame(columns=["id","degree","strength"])
+
+# ---------- Persist & download ----------
+if save_edges_csv and not edge_list.empty:
+    edge_path = f"{output_prefix}_edges.csv"
+    edge_list.to_csv(edge_path, index=False)
+    print(f"Saved edges: {edge_path}")
+    try:
+        files.download(edge_path)
+    except Exception:
+        pass
+
+if save_nodes_csv and not nodes.empty:
+    node_path = f"{output_prefix}_nodes.csv"
+    nodes.to_csv(node_path, index=False)
+    print(f"Saved nodes: {node_path}")
+    try:
+        files.download(node_path)
+    except Exception:
+        pass
+
+if save_graphml and not edge_list.empty:
+    # Build NetworkX graph and write GraphML for Gephi
+    G = nx.Graph()
+    # Ensure node ids are strings for GraphML friendliness
+    node_ids = nodes["id"].astype(str).tolist()
+    G.add_nodes_from(node_ids)
+    for row in edge_list.itertuples(index=False):
+        G.add_edge(str(row.source), str(row.target), weight=int(row.weight))
+    nx.set_node_attributes(G, {str(r.id): int(r.degree) for r in nodes.itertuples(index=False)}, name="degree")
+    nx.set_node_attributes(G, {str(r.id): int(r.strength) for r in nodes.itertuples(index=False)}, name="strength")
+    graphml_path = f"{output_prefix}.graphml"
+    nx.write_graphml(G, graphml_path)
+    print(f"Saved GraphML (Gephi-ready): {graphml_path}")
+    try:
+        files.download(graphml_path)
+    except Exception:
+        pass
+
+# ---------- Quick viz (subset by top degree, thin edges, selectable labels, colored clusters) ----------
+if not edge_list.empty and nodes.shape[0] > 0:
+    # 1) Choose the nodes to PLOT (top by degree)
+    to_plot_ids = nodes.sort_values("degree", ascending=False).head(int(top_nodes_to_plot))["id"]
+    to_plot_ids = set(to_plot_ids)
+
+    sub_edges = edge_list[edge_list["source"].isin(to_plot_ids) & edge_list["target"].isin(to_plot_ids)]
+    if not sub_edges.empty:
+        H = nx.Graph()
+        H.add_weighted_edges_from(sub_edges[["source","target","weight"]].itertuples(index=False, name=None))
+
+        # Communities → colors
+        try:
+            from networkx.algorithms.community import greedy_modularity_communities
+            comms = list(greedy_modularity_communities(H))
+            node2comm = {n: cid for cid, com in enumerate(comms) for n in com}
+        except Exception:
+            node2comm = {n: 0 for n in H.nodes()}
+
+        import matplotlib.cm as cm
+        n_comms = (max(node2comm.values()) + 1) if node2comm else 1
+        cmap = cm.get_cmap("tab20", n_comms)
+        node_colors = [cmap(node2comm.get(n, 0)) for n in H.nodes()]
+
+        # Layout
+        if layout_kind == "kamada_kawai":
+            pos = nx.kamada_kawai_layout(H, weight="weight")
+        else:
+            pos = nx.spring_layout(H, k=0.35, seed=seed, weight="weight")
+
+        # Ultra-thin edges
+        w = np.array([d.get("weight", 1) for _,_,d in H.edges(data=True)], dtype=float)
+        widths = np.clip(np.log1p(w) * 0.2, edge_min_w, edge_max_w)
+
+        # 2) Choose the nodes to LABEL (subset of the plotted nodes)
+        label_map = None
+        if label_option != "none" and top_nodes_to_label > 0:
+            to_label_ids = nodes.sort_values("degree", ascending=False).head(int(top_nodes_to_label))["id"]
+            to_label_ids = set(to_label_ids) & set(H.nodes())  # only label plotted nodes
+
+            if label_option == "node_id":
+                label_map = {n: str(n) for n in H.nodes() if n in to_label_ids}
+
+            elif label_option in ("Group", "SimhashID"):
+                df_attr = df_net[df_net[node_col].astype(str).isin(to_label_ids)]
+                if label_option == "Group":
+                    cand = [c for c in ["Group","group","group_name","group_id","Channel","channel"] if c in df_attr.columns]
+                    if cand:
+                        label_map = (df_attr.groupby(df_attr[node_col].astype(str))[cand[0]]
+                                           .agg(lambda s: s.value_counts().index[0])
+                                           .to_dict())
+                elif label_option == "SimhashID":
+                    label_map = (df_attr.groupby(df_attr[node_col].astype(str))["SimhashID"]
+                                       .agg(lambda s: s.value_counts().index[0])
+                                       .to_dict())
+
+        # Draw
+        plt.figure(figsize=(11, 8))
+        nx.draw_networkx_nodes(H, pos, node_size=120, node_color=node_colors, linewidths=0.0)
+        nx.draw_networkx_edges(H, pos, width=widths, alpha=edge_alpha)
+        if label_map is not None:
+            nx.draw_networkx_labels(H, pos, labels=label_map, font_size=8)
+        plt.title(f"Simhash co-occurrence network ({node_variable}) — top {min(len(to_plot_ids), H.number_of_nodes())} nodes (labels: {min(len(to_plot_ids), int(top_nodes_to_label))})")
+        plt.axis("off")
+        plt.tight_layout()
+        plt.show()
+    else:
+        print("No edges among selected top nodes to visualize.")
+
+# ---------- Summary ----------
+print(f"Nodes: {len(nodes)} | Edges: {len(edge_list)} | Node column: '{node_col}' | Weight mode: {weight_mode}")
